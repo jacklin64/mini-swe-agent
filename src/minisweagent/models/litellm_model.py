@@ -22,6 +22,34 @@ from minisweagent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_model")
 
+# Interleaved reasoning replay. With a reasoning parser (glm45 / deepseek_v4) vLLM
+# moves the assistant's chain-of-thought to `reasoning_content`; without replaying it
+# the model loses its own prior CoT across tool calls. Mirrors OpenHands
+# (openhands/core/message.py + memory/conversation_memory.py): re-send the CoT under a
+# top-level key the model's chat template reads for historical reasoning (`reasoning`
+# for DeepSeek/vLLM), NOT inline in `content`. Honors the same env vars as OpenHands.
+REASONING_REPLAY_FIELD = os.environ.get("OPENHANDS_REASONING_REPLAY_FIELD", "reasoning")
+INTERLEAVED_REASONING = os.environ.get(
+    "MSWEA_INTERLEAVED_REASONING", os.environ.get("OPENHANDS_INTERLEAVED_REASONING", "0")
+).lower() in ("1", "true", "yes", "on")
+
+
+def _extract_reasoning_content(assistant_msg) -> str | None:
+    """Pull reasoning/CoT text from a litellm response message (mirrors OpenHands).
+
+    litellm normalizes a vLLM `reasoning`/`reasoning_content` response field onto
+    `message.reasoning_content`; some versions keep the raw value in
+    `provider_specific_fields`. Check all of these.
+    """
+    reasoning = getattr(assistant_msg, "reasoning_content", None)
+    if not reasoning:
+        psf = getattr(assistant_msg, "provider_specific_fields", None) or {}
+        if isinstance(psf, dict):
+            reasoning = psf.get("reasoning_content") or psf.get("reasoning")
+    if not reasoning:
+        reasoning = getattr(assistant_msg, "reasoning", None)
+    return reasoning if reasoning else None
+
 
 class LitellmModelConfig(BaseModel):
     model_name: str
@@ -84,6 +112,15 @@ class LitellmModel:
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = response.choices[0].message.model_dump()
+        # Interleaved reasoning: replay this turn's CoT under the field the chat
+        # template reads (see module header). Drop the raw reasoning_content key so
+        # we don't also send a stray field the server may not expect. Stored on the
+        # message, so it also lands in the trajectory for distillation.
+        if INTERLEAVED_REASONING:
+            reasoning = _extract_reasoning_content(response.choices[0].message)
+            message.pop("reasoning_content", None)
+            if reasoning:
+                message[REASONING_REPLAY_FIELD] = reasoning
         message["extra"] = {
             "actions": self._parse_actions(response),
             "response": response.model_dump(),
